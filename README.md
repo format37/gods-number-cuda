@@ -117,4 +117,6 @@ The `--bounds` flag runs a post-BFS analysis that computes:
 | 5x5x5 | 2.83e74 | 7 | 67 | unknown |
 | 6x6x6 | 1.57e116 | 7 | 104 | unknown |
 
-See `docs/diameter_lower_bound_tech_spec.md` for methodology details.
+For methodology, validation, and comparison with published results, see:
+- `docs/empirical_diameter_bounds.md` -- analysis of results, why the extrapolation works, comparison with literature
+- `docs/diameter_lower_bound_tech_spec.md` -- implementation spec for the bounds module
