@@ -22,19 +22,21 @@ make -j$(nproc)
 ## Usage
 
 ```
-./gods_number [N] [max_depth]
+./gods_number [N] [max_depth] [--bounds[=file.json]]
 
   N          Cube size (default: 2)
   max_depth  Stop BFS at this depth, 0 = unlimited (default: 0)
+  --bounds   Run diameter lower-bound analysis after BFS
+  --bounds=F Also write JSON report to file F
 ```
 
 ### Examples
 
 ```bash
-./gods_number              # 2x2x2 full BFS -> God's number = 11
-./gods_number 2 5          # 2x2x2 BFS to depth 5
-./gods_number 3 7          # 3x3x3 BFS to depth 7
-./gods_number 4 5          # 4x4x4 BFS to depth 5
+./gods_number                        # 2x2x2 full BFS -> God's number = 11
+./gods_number 3 7                    # 3x3x3 BFS to depth 7
+./gods_number 4 7 --bounds           # 4x4x4 depth 7 + lower-bound analysis
+./gods_number 4 7 --bounds=out.json  # same, with JSON report
 ```
 
 ### Sample output (N=3, depth 7)
@@ -95,3 +97,24 @@ set(CMAKE_CUDA_ARCHITECTURES "80;86;89")
 2. **Move application** -- Precomputed facelet permutations generated from 3D rotation geometry with face-mapping to resolve edge/corner coordinate ambiguity.
 3. **Dedup** -- GPU open-addressing hash table (64-bit FNV-1a + murmurhash3 finalizer, linear probing). Memory auto-sized to ~85% of free VRAM.
 4. **Depth limit** -- BFS stops at `max_depth` or when the state buffer fills. On a 24 GB GPU, N=3 fits ~210M states (depth ~7-8).
+
+## Diameter lower bounds
+
+The `--bounds` flag runs a post-BFS analysis that computes:
+
+- **Proven lower bound**: the smallest depth where the cumulative state count could cover the group. For bounded BFS this is `D_max + 1` (trivial but rigorous).
+- **Extrapolated lower bound**: assumes the measured branching factor continues, estimates when cumulative states would reach |G|. Not a proof, but a useful estimate.
+- **Branching factor**: `b_eff(d) = N(d)/N(d-1)`, converging to ~13.3 for outer-face HTM.
+- **Saturation detection**: identifies when frontier growth starts slowing (observable for N=2, not for bounded BFS on larger cubes).
+
+### Reference results (RTX 4090, depth 7)
+
+| Cube | Group order | Proven LB | Extrapolated LB | Known diameter |
+|------|------------|-----------|-----------------|----------------|
+| 2x2x2 | 3.67e6 | **11** (exact) | 11 | 11 |
+| 3x3x3 | 4.33e19 | 8 | 18 | 20 |
+| 4x4x4 | 7.40e45 | 8 | 41 | unknown |
+| 5x5x5 | 2.83e74 | 7 | 67 | unknown |
+| 6x6x6 | 1.57e116 | 7 | 104 | unknown |
+
+See `docs/diameter_lower_bound_tech_spec.md` for methodology details.

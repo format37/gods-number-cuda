@@ -328,7 +328,10 @@ static uint32_t next_pow2(uint32_t v) {
 // --------------------------------------------------------------------------
 // Host BFS driver
 // --------------------------------------------------------------------------
-static int solve_general(int N, int max_depth) {
+// Forward declaration (defined in main.cu)
+struct BFSHistogram;
+
+static int solve_general(int N, int max_depth, BFSHistogram& hist) {
     const int state_size = 6 * N * N;
     const int num_moves = 18;
 
@@ -452,6 +455,10 @@ static int solve_general(int N, int max_depth) {
     uint64_t total = 1;
     int gods_number = 0;
 
+    memset(hist.counts, 0, sizeof(hist.counts));
+    hist.counts[0] = 1;
+    hist.cube_size = N;
+
     printf("BFS from solved state:\n");
     printf("  Depth %2d: %12u states  (cumulative: %12llu)\n", 0, 1u, 1ULL);
 
@@ -490,6 +497,7 @@ static int solve_general(int N, int max_depth) {
         if (frontier_size > 0) {
             total += frontier_size;
             gods_number = depth + 1;
+            if (depth + 1 < 64) hist.counts[depth + 1] = frontier_size;
             printf("  Depth %2d: %12u states  (cumulative: %12llu)\n",
                    depth + 1, frontier_size, (unsigned long long)total);
         }
@@ -499,6 +507,11 @@ static int solve_general(int N, int max_depth) {
         cudaMemcpy(&current_states, d_state_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
         if (current_states >= max_states) {
             printf("\n  Stopped: state buffer full (%u states)\n", current_states);
+            // Last depth is truncated -- exclude from histogram for bounds analysis
+            if (frontier_size > 0 && depth + 1 < 64) {
+                hist.counts[depth + 1] = 0;
+                gods_number = depth; // revert to last complete depth
+            }
             break;
         }
 
@@ -515,6 +528,8 @@ static int solve_general(int N, int max_depth) {
         printf("Explored to depth:  %d\n", gods_number);
     printf("Total states:       %llu\n", (unsigned long long)total);
     printf("BFS time:           %.3f seconds\n", elapsed);
+
+    hist.depth_count = gods_number + 1;
 
     // Cleanup
     cudaFree(d_states);

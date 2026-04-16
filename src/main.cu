@@ -5,6 +5,15 @@
 #include <algorithm>
 
 // --------------------------------------------------------------------------
+// Shared histogram structure returned by both solvers
+// --------------------------------------------------------------------------
+struct BFSHistogram {
+    uint64_t counts[64];
+    int depth_count;      // number of entries (max_depth + 1)
+    int cube_size;
+};
+
+// --------------------------------------------------------------------------
 // N=2 compact solver (dense depth array, Lehmer encoding)
 // --------------------------------------------------------------------------
 #include "gpu_tables.cuh"
@@ -56,7 +65,7 @@ static const uint32_t EXPECTED_HISTOGRAM[] = {
     1, 9, 54, 321, 1847, 9992, 50136, 227536, 870072, 1887748, 623800, 2644,
 };
 
-static int solve_2x2(int max_depth) {
+static int solve_2x2(int max_depth, BFSHistogram& hist) {
     printf("=== 2x2x2 Rubik's Cube God's Number Search (HTM");
     if (max_depth > 0) printf(", max_depth=%d", max_depth);
     printf(") ===\n\n");
@@ -91,8 +100,9 @@ static int solve_2x2(int max_depth) {
     CUDA_CHECK(cudaMemcpy(d_frontier_curr, &solved_id, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
     uint32_t frontier_size = 1;
-    uint32_t histogram[32] = {0};
-    histogram[0] = 1;
+    memset(hist.counts, 0, sizeof(hist.counts));
+    hist.counts[0] = 1;
+    hist.cube_size = 2;
     uint32_t total = 1;
     int gods_number = 0;
 
@@ -118,7 +128,7 @@ static int solve_2x2(int max_depth) {
         CUDA_CHECK(cudaMemcpy(&frontier_size, d_next_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
         if (frontier_size > 0) {
-            histogram[depth + 1] = frontier_size;
+            hist.counts[depth + 1] = frontier_size;
             total += frontier_size;
             gods_number = depth + 1;
             printf("  Depth %2d: %10u states  (cumulative: %10u)\n",
@@ -127,6 +137,8 @@ static int solve_2x2(int max_depth) {
 
         std::swap(d_frontier_curr, d_frontier_next);
     }
+
+    hist.depth_count = gods_number + 1;
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
@@ -156,8 +168,9 @@ static int solve_2x2(int max_depth) {
             printf("  [OK]   God's number: %d\n", gods_number);
         }
         for (int d = 0; d < 12; d++) {
-            if (histogram[d] != EXPECTED_HISTOGRAM[d]) {
-                printf("  [FAIL] Depth %d: %u (expected %u)\n", d, histogram[d], EXPECTED_HISTOGRAM[d]);
+            if (hist.counts[d] != EXPECTED_HISTOGRAM[d]) {
+                printf("  [FAIL] Depth %d: %llu (expected %u)\n",
+                       d, (unsigned long long)hist.counts[d], EXPECTED_HISTOGRAM[d]);
                 ok = false;
             }
         }
@@ -183,43 +196,88 @@ static int solve_2x2(int max_depth) {
 #include "solve_general.cuh"
 
 // --------------------------------------------------------------------------
+// Diameter lower-bound analysis
+// --------------------------------------------------------------------------
+#include "diameter_bounds.hpp"
+
+// --------------------------------------------------------------------------
 // CLI
 // --------------------------------------------------------------------------
 static void usage(const char* prog) {
-    printf("Usage: %s [N] [max_depth]\n", prog);
+    printf("Usage: %s [N] [max_depth] [--bounds[=file.json]]\n", prog);
     printf("\n");
     printf("  N          Cube size (default: 2)\n");
     printf("  max_depth  Stop BFS at this depth, 0 = unlimited (default: 0)\n");
+    printf("  --bounds   Run diameter lower-bound analysis after BFS\n");
+    printf("  --bounds=F Also write JSON report to file F\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  %s              # 2x2x2, full BFS -> God's number = 11\n", prog);
-    printf("  %s 2 5          # 2x2x2, BFS to depth 5\n", prog);
-    printf("  %s 3 7          # 3x3x3, BFS to depth 7\n", prog);
-    printf("  %s 4 5          # 4x4x4, BFS to depth 5\n", prog);
+    printf("  %s                        # 2x2x2, full BFS\n", prog);
+    printf("  %s 3 7 --bounds           # 3x3x3, depth 7, with bounds analysis\n", prog);
+    printf("  %s 4 7 --bounds=out.json  # 4x4x4, depth 7, JSON report to out.json\n", prog);
 }
 
 int main(int argc, char** argv) {
     int N = 2;
     int max_depth = 0;
+    bool do_bounds = false;
+    const char* bounds_file = nullptr;
 
+    // Parse args
+    int positional = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "--bounds") == 0) {
+            do_bounds = true;
+        } else if (strncmp(argv[i], "--bounds=", 9) == 0) {
+            do_bounds = true;
+            bounds_file = argv[i] + 9;
+        } else if (argv[i][0] != '-') {
+            if (positional == 0) N = atoi(argv[i]);
+            else if (positional == 1) max_depth = atoi(argv[i]);
+            positional++;
         }
     }
-
-    if (argc >= 2) N = atoi(argv[1]);
-    if (argc >= 3) max_depth = atoi(argv[2]);
 
     if (N < 2 || N > 16) {
         fprintf(stderr, "N must be between 2 and 16 (got %d)\n", N);
         return 1;
     }
 
+    // Run BFS
+    BFSHistogram hist;
+    memset(&hist, 0, sizeof(hist));
+    hist.cube_size = N;
+    int rc;
+
     if (N == 2) {
-        return solve_2x2(max_depth);
+        rc = solve_2x2(max_depth, hist);
     } else {
-        return solve_general(N, max_depth);
+        rc = solve_general(N, max_depth, hist);
     }
+
+    // Bounds analysis
+    if (do_bounds && hist.depth_count >= 3) {
+        BoundsResult bounds = analyze_bounds(
+            hist.counts, hist.depth_count, N);
+
+        print_bounds_summary(bounds);
+
+        if (bounds_file) {
+            FILE* fp = fopen(bounds_file, "w");
+            if (fp) {
+                write_bounds_json(bounds, fp);
+                fclose(fp);
+                printf("Bounds JSON written to: %s\n", bounds_file);
+            } else {
+                fprintf(stderr, "Failed to open %s for writing\n", bounds_file);
+            }
+        }
+    } else if (do_bounds && hist.depth_count < 3) {
+        printf("\nBounds analysis requires at least 3 BFS depths.\n");
+    }
+
+    return rc;
 }
