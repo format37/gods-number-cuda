@@ -4,12 +4,14 @@
 #include <chrono>
 #include <algorithm>
 
+// --------------------------------------------------------------------------
+// N=2 compact solver (dense depth array, Lehmer encoding)
+// --------------------------------------------------------------------------
 #include "gpu_tables.cuh"
 #include "move_tables.cuh"
 #include "state_codec.cuh"
 
-// ---- Kernel (inline in same TU to share __constant__ memory) ----
-__global__ void expand_frontier(
+__global__ void expand_frontier_2x2(
     const uint32_t* __restrict__ frontier,
     uint32_t frontier_size,
     uint32_t* depth_array,
@@ -50,28 +52,15 @@ __global__ void expand_frontier(
     } \
 } while(0)
 
-// Expected HTM depth histogram for verification
 static const uint32_t EXPECTED_HISTOGRAM[] = {
-    1,          // depth 0
-    9,          // depth 1
-    54,         // depth 2
-    321,        // depth 3
-    1847,       // depth 4
-    9992,       // depth 5
-    50136,      // depth 6
-    227536,     // depth 7
-    870072,     // depth 8
-    1887748,    // depth 9
-    623800,     // depth 10
-    2644,       // depth 11
+    1, 9, 54, 321, 1847, 9992, 50136, 227536, 870072, 1887748, 623800, 2644,
 };
-static const int EXPECTED_GODS_NUMBER = 11;
-static const int EXPECTED_HISTOGRAM_SIZE = 12; // depths 0-11
 
-int main() {
-    printf("=== 2x2x2 Rubik's Cube God's Number Search (HTM) ===\n\n");
+static int solve_2x2(int max_depth) {
+    printf("=== 2x2x2 Rubik's Cube God's Number Search (HTM");
+    if (max_depth > 0) printf(", max_depth=%d", max_depth);
+    printf(") ===\n\n");
 
-    // Print GPU info
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("GPU: %s (compute %d.%d, %d SMs, %.1f GB)\n\n",
@@ -79,28 +68,23 @@ int main() {
            prop.multiProcessorCount,
            prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
 
-    // Initialize and validate move tables
     if (!init_move_tables()) {
-        fprintf(stderr, "Move table validation FAILED. Aborting.\n");
+        fprintf(stderr, "Move table validation FAILED.\n");
         return 1;
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    // Allocate depth array on device (uint32, one entry per state)
     uint32_t* d_depth;
-    CUDA_CHECK(cudaMalloc(&d_depth, NUM_STATES * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_depth, 0xFF, NUM_STATES * sizeof(uint32_t)));
-
-    // Allocate frontier buffers
     uint32_t* d_frontier_curr;
     uint32_t* d_frontier_next;
     uint32_t* d_next_count;
+    CUDA_CHECK(cudaMalloc(&d_depth, NUM_STATES * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_depth, 0xFF, NUM_STATES * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_frontier_curr, NUM_STATES * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_frontier_next, NUM_STATES * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_next_count, sizeof(uint32_t)));
 
-    // Seed with solved state (identity permutation, zero orientation = state_id 0)
     uint32_t solved_id = 0;
     uint32_t zero = 0;
     CUDA_CHECK(cudaMemcpy(d_depth + solved_id, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -117,21 +101,20 @@ int main() {
 
     const uint32_t BLOCK_SIZE = 256;
 
-    // BFS loop
     for (uint32_t depth = 0; frontier_size > 0; depth++) {
-        // Reset next frontier counter
-        CUDA_CHECK(cudaMemset(d_next_count, 0, sizeof(uint32_t)));
+        if (max_depth > 0 && (int)depth >= max_depth) {
+            printf("\n  Stopped at max_depth=%d\n", max_depth);
+            break;
+        }
 
-        // Launch kernel
+        CUDA_CHECK(cudaMemset(d_next_count, 0, sizeof(uint32_t)));
         uint32_t grid_size = (frontier_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        expand_frontier<<<grid_size, BLOCK_SIZE>>>(
+        expand_frontier_2x2<<<grid_size, BLOCK_SIZE>>>(
             d_frontier_curr, frontier_size,
             d_depth, d_frontier_next, d_next_count,
-            depth + 1
-        );
+            depth + 1);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Read back next frontier size
         CUDA_CHECK(cudaMemcpy(&frontier_size, d_next_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
         if (frontier_size > 0) {
@@ -142,54 +125,101 @@ int main() {
                    depth + 1, frontier_size, total);
         }
 
-        // Swap frontier buffers
         std::swap(d_frontier_curr, d_frontier_next);
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
 
-    // Results
     printf("\n=== Results ===\n");
-    printf("God's number (HTM): %d\n", gods_number);
+    bool complete = (frontier_size == 0) && (max_depth <= 0 || gods_number < max_depth);
+    if (complete)
+        printf("God's number (HTM): %d\n", gods_number);
+    else
+        printf("Explored to depth:  %d\n", gods_number);
     printf("Total states:       %u\n", total);
     printf("BFS time:           %.3f seconds\n", elapsed);
 
-    // Verification
-    printf("\n=== Verification ===\n");
-    bool ok = true;
-
-    if (total != NUM_STATES) {
-        printf("  [FAIL] Total states: %u (expected %u)\n", total, NUM_STATES);
-        ok = false;
-    } else {
-        printf("  [OK]   Total states: %u\n", total);
-    }
-
-    if (gods_number != EXPECTED_GODS_NUMBER) {
-        printf("  [FAIL] God's number: %d (expected %d)\n", gods_number, EXPECTED_GODS_NUMBER);
-        ok = false;
-    } else {
-        printf("  [OK]   God's number: %d\n", gods_number);
-    }
-
-    for (int d = 0; d < EXPECTED_HISTOGRAM_SIZE; d++) {
-        if (histogram[d] != EXPECTED_HISTOGRAM[d]) {
-            printf("  [FAIL] Depth %d: %u (expected %u)\n", d, histogram[d], EXPECTED_HISTOGRAM[d]);
+    if (complete) {
+        printf("\n=== Verification ===\n");
+        bool ok = true;
+        if (total != NUM_STATES) {
+            printf("  [FAIL] Total states: %u (expected %u)\n", total, NUM_STATES);
             ok = false;
+        } else {
+            printf("  [OK]   Total states: %u\n", total);
         }
-    }
-    if (ok) {
-        printf("  [OK]   Depth histogram matches expected values\n");
+        if (gods_number != 11) {
+            printf("  [FAIL] God's number: %d (expected 11)\n", gods_number);
+            ok = false;
+        } else {
+            printf("  [OK]   God's number: %d\n", gods_number);
+        }
+        for (int d = 0; d < 12; d++) {
+            if (histogram[d] != EXPECTED_HISTOGRAM[d]) {
+                printf("  [FAIL] Depth %d: %u (expected %u)\n", d, histogram[d], EXPECTED_HISTOGRAM[d]);
+                ok = false;
+            }
+        }
+        if (ok) printf("  [OK]   Depth histogram matches expected values\n");
+        printf("\n%s\n", ok ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
+        CUDA_CHECK(cudaFree(d_depth));
+        CUDA_CHECK(cudaFree(d_frontier_curr));
+        CUDA_CHECK(cudaFree(d_frontier_next));
+        CUDA_CHECK(cudaFree(d_next_count));
+        return ok ? 0 : 1;
     }
 
-    printf("\n%s\n", ok ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
-
-    // Cleanup
     CUDA_CHECK(cudaFree(d_depth));
     CUDA_CHECK(cudaFree(d_frontier_curr));
     CUDA_CHECK(cudaFree(d_frontier_next));
     CUDA_CHECK(cudaFree(d_next_count));
+    return 0;
+}
 
-    return ok ? 0 : 1;
+// --------------------------------------------------------------------------
+// General NxNxN solver (facelet representation, hash table)
+// --------------------------------------------------------------------------
+#include "solve_general.cuh"
+
+// --------------------------------------------------------------------------
+// CLI
+// --------------------------------------------------------------------------
+static void usage(const char* prog) {
+    printf("Usage: %s [N] [max_depth]\n", prog);
+    printf("\n");
+    printf("  N          Cube size (default: 2)\n");
+    printf("  max_depth  Stop BFS at this depth, 0 = unlimited (default: 0)\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s              # 2x2x2, full BFS -> God's number = 11\n", prog);
+    printf("  %s 2 5          # 2x2x2, BFS to depth 5\n", prog);
+    printf("  %s 3 7          # 3x3x3, BFS to depth 7\n", prog);
+    printf("  %s 4 5          # 4x4x4, BFS to depth 5\n", prog);
+}
+
+int main(int argc, char** argv) {
+    int N = 2;
+    int max_depth = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+    }
+
+    if (argc >= 2) N = atoi(argv[1]);
+    if (argc >= 3) max_depth = atoi(argv[2]);
+
+    if (N < 2 || N > 16) {
+        fprintf(stderr, "N must be between 2 and 16 (got %d)\n", N);
+        return 1;
+    }
+
+    if (N == 2) {
+        return solve_2x2(max_depth);
+    } else {
+        return solve_general(N, max_depth);
+    }
 }
